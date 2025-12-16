@@ -37,6 +37,17 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 pip install -r requirements.txt
 ```
 
+## 📥 Pretrained Model Download
+
+Download the [Wan2.1-I2V-14B](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers) model and save it to the `pretrained_model/` folder.
+
+```bash
+pip install huggingface_hub
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Wan-AI/Wan2.1-I2V-14B-480P-Diffusers', local_dir='./pretrained_model/Wan2.1-I2V-14B-480P-Diffusers')"
+```
+
+```
+
 ## 📝 Citation
 
 If you use this dataset or code in your research, please cite our paper:
