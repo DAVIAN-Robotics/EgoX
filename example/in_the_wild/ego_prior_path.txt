@@ -1,0 +1,4 @@
+./example/in_the_wild/ego_prior_videos/joker.mp4
+./example/in_the_wild/ego_prior_videos/ironman.mp4
+./example/in_the_wild/ego_prior_videos/hulk_blackwidow.mp4
+./example/in_the_wild/ego_prior_videos/tabletennis.mp4
