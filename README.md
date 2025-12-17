@@ -118,6 +118,13 @@ python3 infer.py \
     --cos_sim_scaling_factor 3.0
 ```
 
+## 🙏 Acknowledgements
+
+This project is built upon the following works:
+
+- [4DNeX](https://github.com/3DTopia/4DNeX)
+- [Ego-Exo4D](https://github.com/facebookresearch/Ego-Exo)
+
 ## 📝 Citation
 
 If you use this dataset or code in your research, please cite our paper:
