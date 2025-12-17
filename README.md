@@ -30,6 +30,15 @@ https://github.com/user-attachments/assets/5f599ad0-0922-414b-a8ab-e789da068efa
 
 ## 🛠️ Environment Setup
 
+### System Requirements
+
+- **GPU**: TBD
+- **CUDA**: 12.1 or higher
+- **Python**: 3.10
+- **PyTorch**: Compatible with CUDA 12.1
+
+### Installation
+
 Create a conda environment and install dependencies:
 
 ```bash
@@ -44,7 +53,9 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 pip install -r requirements.txt
 ```
 
-## 📥 Pretrained Model Download
+## 📥 Model Weights Download
+
+### Wan2.1-I2V-14B Pretrained Model
 
 Download the [Wan2.1-I2V-14B](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers) model and save it to the `checkpoints/pretrained_model/` folder.
 
@@ -53,9 +64,33 @@ pip install huggingface_hub
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Wan-AI/Wan2.1-I2V-14B-480P-Diffusers', local_dir='./checkpoints/pretrained_model/Wan2.1-I2V-14B-480P-Diffusers')"
 ```
 
-## 📥 EgoX Model Weights Download
+### 📥 EgoX Model Weights Download
 
 Download the trained EgoX LoRA weights from [Google Drive](https://drive.google.com/file/d/1Q7j7LVI4YiSkwzNMBBiyLS1rT3HMcNVB/view?usp=drive_link) and save them to the `checkpoints/EgoX/` folder.
+
+## 🚀 Inference
+
+### File Structure
+
+Prepare your data files in the following structure:
+
+```
+example/
+├── in_the_wild/          # or ego4D/
+│   ├── caption.txt              # Text prompts (one per line)
+│   ├── exo_gt_path.txt         # Exocentric video paths (one per line)
+│   ├── ego_prior_path.txt      # Egocentric prior video paths (one per line)
+│   ├── camera_params.json      # Camera parameters
+│   └── depth_maps/             # Depth maps directory
+```
+
+### Run Inference
+
+```bash
+bash scripts/infer.sh
+```
+
+Edit `scripts/infer.sh` to configure GPU ID, seed, and data paths. Comment/uncomment the relevant section for in-the-wild or Ego4D inference.
 
 ## 📝 Citation
 
