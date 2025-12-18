@@ -20,4 +20,5 @@ python3 infer.py \
     --seed $SEED \
     --use_GGA \
     --cos_sim_scaling_factor 3.0 \
-    --in_the_wild
+    --in_the_wild \
+    --idx 1

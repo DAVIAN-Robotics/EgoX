@@ -49,9 +49,8 @@ def main(args):
     exo_videos = exo_video_list
     ego_prior_videos = ego_prior_video_list
     depth_map_paths = []
-    depth_intrinsics = []
-    camera_extrinsics = []
     camera_intrinsics = []
+    camera_extrinsics = []
     ego_extrinsics = []
     ego_intrinsics = []
     take_names = []
@@ -65,8 +64,6 @@ def main(args):
         take_name = exo_videos[i].split('/')[-2]
         i += 1
         depth_map_paths.append(Path(os.path.join(depth_root, take_name)))
-        depth_intrinsic = np.array([[1238.9679415422443, 0.0, 1920.0], [0.0, 1238.9679415422443, 1080.0], [0.0, 0.0, 1.0]])
-        depth_intrinsics.append(depth_intrinsic)
         camera_extrinsics.append(meta['camera_extrinsics'])
         camera_intrinsics.append(meta['camera_intrinsics'])
         ego_extrinsics.append(meta['ego_extrinsics'])
@@ -113,9 +110,8 @@ def main(args):
 
         if args.use_GGA:
             depth_map_path = depth_map_paths[i]
-            depth_intrinsic = depth_intrinsics[i]
-            camera_extrinsic = camera_extrinsics[i]
             camera_intrinsic = camera_intrinsics[i]
+            camera_extrinsic = camera_extrinsics[i]
             ego_extrinsic = ego_extrinsics[i]
             ego_intrinsic = ego_intrinsics[i]
 
@@ -174,14 +170,14 @@ def main(args):
             height, width = depth_maps.shape[1], depth_maps.shape[2]
             cx = width / 2.0
             cy = height / 2.0
-            depth_intrinsic_scale_y = cy / depth_intrinsic[1,2]
-            depth_intrinsic_scale_x = cx / depth_intrinsic[0,2]
-            depth_intrinsic[0, 0] = depth_intrinsic[0, 0] * depth_intrinsic_scale_x
-            depth_intrinsic[1, 1] = depth_intrinsic[1, 1] * depth_intrinsic_scale_y
-            depth_intrinsic[0, 2] = cx
-            depth_intrinsic[1, 2] = cy
+            camera_intrinsic_scale_y = cy / camera_intrinsic[1,2]
+            camera_intrinsic_scale_x = cx / camera_intrinsic[0,2]
+            camera_intrinsic[0, 0] = camera_intrinsic[0, 0] * camera_intrinsic_scale_x
+            camera_intrinsic[1, 1] = camera_intrinsic[1, 1] * camera_intrinsic_scale_y
+            camera_intrinsic[0, 2] = cx
+            camera_intrinsic[1, 2] = cy
 
-            depth_intrinsic = np.array([depth_intrinsic[0, 0] , depth_intrinsic[1, 1], cx, cy])
+            camera_intrinsic = np.array([camera_intrinsic[0, 0] , camera_intrinsic[1, 1], cx, cy])
             
 
             disp_v, disp_u = torch.meshgrid(
@@ -196,7 +192,7 @@ def main(args):
             disp_u_cpu = disp_u.cpu()
             disp_v_cpu = disp_v.cpu()
             
-            pts, _, _ = iproj_disp(torch.from_numpy(depth_intrinsic), disp_cpu, disp_u_cpu, disp_v_cpu)
+            pts, _, _ = iproj_disp(torch.from_numpy(camera_intrinsic), disp_cpu, disp_u_cpu, disp_v_cpu)
 
             if isinstance(pts, torch.Tensor):
                 pts = pts.to(device)
