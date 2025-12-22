@@ -101,75 +101,32 @@ To run inference with your own data, prepare the following file structure:
 
 ```
 your_dataset/              # Your custom dataset folder
-├── caption.txt            # Text prompts (one per line)
-├── exo_path.txt           # Exocentric video paths (one per line)
-├── ego_prior_path.txt     # Egocentric prior video paths (one per line)
-├── camera_params.json     # Camera parameters
+├── meta.json              # Meta information for each video
+├── videos/                # Videos directory
+    └── take_name/
+        ├── ego_Prior.mp4
+        ├── exo.mp4
+        └── ...
 └── depth_maps/            # Depth maps directory
     └── take_name/
         ├── frame_000.npy
         └── ...
 ```
 
-<details>
-<summary><b>caption.txt</b> - Text prompts for each video (one per line)</summary>
-
-Each line contains a detailed text description for the corresponding video, including both exocentric and egocentric scene overviews and action analyses.
-
-**Example:**
-```
-[Exo view]\n**Scene Overview:**\nThe scene is set on a street in front of a hospital, indicated by the large "EMERGENCY" sign visible in the background. The ground is asphalt, marked with yellow lines, and appears to have debris scattered across it...\n\n[Ego view]\n**Scene Overview:**\nFrom the inferred first-person perspective, the environment appears chaotic and filled with smoke...
-[Exo view]\n**Scene Overview:**\nThe environment is a clinical or laboratory-like setting characterized by a smooth, gray ceiling with fluorescent lighting fixtures...
-[Exo view]\n**Scene Overview:**\nThe environment is a dense forest with a mixture of coniferous trees and underbrush...
-[Exo view]\n**Scene Overview:**\nThe scene is set in a table tennis arena, featuring a black rubberized floor with the text "PARIS 2024" printed in white...
-```
-
-</details>
 
 <details>
-<summary><b>exo_path.txt</b> - Paths to exocentric videos (one per line)</summary>
+<summary><b>meta.json</b> - Meta information for each video</summary>
 
-Each line contains the relative or absolute path to an exocentric video file. The order should match the corresponding lines in `caption.txt` and `ego_prior_path.txt`.
-
-**Example:**
-```
-./example/in_the_wild/videos/joker/exo.mp4
-./example/in_the_wild/videos/ironman/exo.mp4
-./example/in_the_wild/videos/hulk_blackwidow/exo.mp4
-./example/in_the_wild/videos/tabletennis/exo.mp4
-```
-
-</details>
-
-<details>
-<summary><b>ego_prior_path.txt</b> - Paths to egocentric prior videos (one per line)</summary>
-
-Each line contains the relative or absolute path to an egocentric prior video file. The order should match the corresponding lines in `caption.txt` and `exo_path.txt`.
-
-**Example:**
-```
-./example/in_the_wild/videos/joker/ego_Prior.mp4
-./example/in_the_wild/videos/ironman/ego_Prior.mp4
-./example/in_the_wild/videos/hulk_blackwidow/ego_Prior.mp4
-./example/in_the_wild/videos/tabletennis/ego_Prior.mp4
-```
-
-</details>
-
-<details>
-<summary><b>camera_params.json</b> - Camera parameters in JSON format</summary>
-
-JSON file containing camera intrinsic and extrinsic parameters for each video. The structure includes `test_datasets` array with entries for each video containing camera intrinsics/extrinsics and ego intrinsics/extrinsics.
+JSON file containing exocentric video path, egocentric prior video path, prompt, camera intrinsic and extrinsic parameters for each video. The structure includes `test_datasets` array with entries for each videos.
 
 **Example:**
 ```json
 {
     "test_datasets": [
         {
-            "path": "./example/in_the_wild/exo_videos/joker.mp4",
-            "best_camera": "none",
-            "source_frame_start": 0,
-            "source_frame_end": 48,
+            "exo_path": "./example/in_the_wild/videos/joker/exo.mp4",
+            "ego_prior_path": "./example/in_the_wild/videos/joker/ego_Prior.mp4",
+            "prompt": "[Exo view]\n**Scene Overview:**\nThe scene is set on a str...\n\n[Ego view]\n**Scene Overview:**\nFrom the inferred first-person perspective, the environment appears chaotic and filled with sm...",
             "camera_intrinsics": [
                 [634.47327, 0.0, 392.0],
                 [0.0, 634.4733, 224.0],
@@ -195,6 +152,61 @@ JSON file containing camera intrinsic and extrinsic parameters for each video. T
         ...
     ]
 }
+```
+
+</details>
+
+To prepare your own dataset, follow the instruction from [here](https://github.com/kdh8156/EgoX-EgoPriorRenderer).
+
+<details>
+<summary><b>Custom dataset init structure</b></summary>
+
+Before running the script, you need to create a custom dataset folder with the following structure:
+
+```
+your_dataset/              # Your custom dataset folder
+├── videos/                # Videos directory
+    └── take_name/
+        └──  exo.mp4
+```
+
+Then, by using `meta_init.py`, you can create a meta.json file with the following command:
+
+```
+python meta_init.py --folder_path ./your_dataset --output_json ./your_dataset/meta.json --overwrite
+```
+
+```
+your_dataset/              # Your custom dataset folder
+├── meta.json              # Meta information for each video
+├── videos/                # Videos directory
+    └── take_name/
+        └──  exo.mp4
+```
+
+Then, you can use `caption.py` to generate caption for each video with this command:
+
+```
+python caption.py --json_file ./your_dataset/meta.json --output_json ./your_dataset/meta.json --overwrite
+```
+
+Make sure that your api key is properly set in `caption.py`.
+
+Finally, follow the instruction from [here](https://github.com/kdh8156/EgoX-EgoPriorRenderer).
+Then you can get depth maps, camera intrinsic, ego camera extrinsics for each video.
+
+```
+your_dataset/              # Your custom dataset folder
+├── meta.json              # Meta information for each video
+├── videos/                # Videos directory
+    └── take_name/
+        ├── ego_Prior.mp4
+        ├── exo.mp4
+        └── ...
+└── depth_maps/            # Depth maps directory
+    └── take_name/
+        ├── frame_000.npy
+        └── ...
 ```
 
 </details>

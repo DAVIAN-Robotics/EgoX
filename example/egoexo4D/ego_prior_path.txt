@@ -1,5 +1,0 @@
-./example/egoexo4D/videos/cmu_soccer06_6_877_925/ego_Prior.mp4
-./example/egoexo4D/videos/iiith_cooking_57_2_2451_2499/ego_Prior.mp4
-./example/egoexo4D/videos/sfu_basketball014_4_1000_1048/ego_Prior.mp4
-./example/egoexo4D/videos/sfu_covid_009_4_2000_2048/ego_Prior.mp4
-./example/egoexo4D/videos/uniandes_dance_008_50_877_925/ego_Prior.mp4

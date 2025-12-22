@@ -136,6 +136,7 @@ def main(args):
                 ego_extrinsic = torch.cat([ego_extrinsic, torch.tensor([[[0, 0, 0, 1]]], dtype=ego_extrinsic.dtype).expand(ego_extrinsic.shape[0], -1, -1)], dim=1)
             if camera_extrinsic.shape == (3, 4):
                 camera_extrinsic = torch.cat([torch.tensor(camera_extrinsic, dtype=ego_extrinsic.dtype), torch.tensor([[0, 0, 0, 1]], dtype=ego_extrinsic.dtype)], dim=0)
+
             scale = 1/8
             scaled_intrinsic = ego_intrinsic.clone()
             scaled_intrinsic[0, 0] *= scale  # fx' = fx * s
@@ -149,6 +150,7 @@ def main(args):
 
             pixel_coords_cv = pixel_coords[..., :2].cpu().numpy().reshape(-1, 1, 2).astype(np.float32)
             K = scaled_intrinsic.cpu().numpy().astype(np.float32)
+
             import cv2
             #! Ego cam distorion coeffs (Project Aria) - Hard coded
             distortion_coeffs = np.array([[-0.02340373583137989,0.09388021379709244,-0.06088035926222801,0.0053304750472307205,0.003342868760228157,-0.0006356257363222539,0.0005087381578050554,-0.0004747129278257489,-0.0011330085108056664,-0.00025734835071489215,0.00009328465239377692,0.00009424977179151028]])
@@ -179,7 +181,6 @@ def main(args):
 
             camera_intrinsic = np.array([camera_intrinsic[0, 0] , camera_intrinsic[1, 1], cx, cy])
             
-
             disp_v, disp_u = torch.meshgrid(
                 torch.arange(depth_maps.shape[1], device=device).float(),
                 torch.arange(depth_maps.shape[2],device=device).float(),

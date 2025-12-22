@@ -1,4 +1,0 @@
-./example/in_the_wild/videos/joker/ego_Prior.mp4
-./example/in_the_wild/videos/ironman/ego_Prior.mp4
-./example/in_the_wild/videos/hulk_blackwidow/ego_Prior.mp4
-./example/in_the_wild/videos/tabletennis/ego_Prior.mp4
