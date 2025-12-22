@@ -148,12 +148,58 @@ JSON file containing exocentric video path, egocentric prior video path, prompt,
 
 To prepare your own dataset, follow the instruction from [here](https://github.com/kdh8156/EgoX-EgoPriorRenderer).
 
-For caption, you can use `caption.py` with this command
+<details>
+<summary><b>Custom dataset init structure</b></summary>
+
+Before running the script, you need to create a custom dataset folder with the following structure:
+
+```
+your_dataset/              # Your custom dataset folder
+├── videos/                # Videos directory
+    └── take_name/
+        └──  exo.mp4
+```
+
+Then, by using `make_meta_init.py`, you can create a meta.json file with the following command:
+
+```
+python make_meta_init.py --folder_path ./your_dataset --output_json ./your_dataset/meta.json --overwrite
+```
+
+```
+your_dataset/              # Your custom dataset folder
+├── meta.json              # Meta information for each video
+├── videos/                # Videos directory
+    └── take_name/
+        └──  exo.mp4
+```
+
+Then, you can use `caption.py` to generate caption for each video with this command:
+
 ```
 python caption.py --json_file ./your_dataset/meta.json --output_json ./your_dataset/meta.json --overwrite
 ```
 
 Make sure that your api key is properly set in `caption.py`.
+
+Finally, follow the instruction from [here](https://github.com/kdh8156/EgoX-EgoPriorRenderer).
+Then you can get depth maps, camera intrinsic, ego camera extrinsics for each video.
+
+```
+your_dataset/              # Your custom dataset folder
+├── meta.json              # Meta information for each video
+├── videos/                # Videos directory
+    └── take_name/
+        ├── ego_Prior.mp4
+        ├── exo.mp4
+        └── ...
+└── depth_maps/            # Depth maps directory
+    └── take_name/
+        ├── frame_000.npy
+        └── ...
+```
+
+</details>
 
 Then, modify `scripts/infer_itw.sh` (or create a new script) to point to your data paths:
 
