@@ -230,6 +230,10 @@ python3 infer.py \
     --in_the_wild
 ```
 
+## 🌟 Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=DAVIAN-Robotics/EgoX&type=date&legend=top-left)](https://www.star-history.com/#DAVIAN-Robotics/EgoX&type=date&legend=top-left)
+
 ## 🙏 Acknowledgements
 
 This project is built upon the following works:
