@@ -16,30 +16,22 @@
 https://github.com/user-attachments/assets/5f599ad0-0922-414b-a8ab-e789da068efa
 
 
-## 📋 TODO
+## About EgoX
 
-### 🔹 This Week
-- [x] Release **inference code**
-- [x] Release **model weights**
-- [x] Release **data preprocessing code (for inference)**
+**EgoX** is a novel egocentric video generation framework that produces first-person (ego-view) videos from a single third-person (exo-view) video input. By leveraging both exocentric observations and egocentric priors, EgoX enables realistic viewpoint transformation while preserving temporal consistency and scene structure. The method introduces a unified conditioning strategy that integrates spatial and channel-wise information within clean latent representations, requiring only lightweight LoRA-based adaptation. EgoX is built upon large-scale video diffusion models and is trained on the Ego-Exo4D dataset, making it a powerful tool for egocentric video synthesis and related research applications.
 
----
 
-### 🔹 By End of December
-- [x] Release **training code**
-- [x] Release **data preprocessing code (for train)**
 
-### 🔹 Ongoing
-- [ ] Release **user-friendly interface**
 
 ## 🛠️ Environment Setup
 
 ### System Requirements
 
-- **GPU**: < 80GB (for inference) < 140GB (for train)
+- **GPU**: ≥ 80GB VRAM (for inference), ≥ 140GB VRAM (for training)
 - **CUDA**: 12.1 or higher
 - **Python**: 3.10
-- **PyTorch**: Compatible with CUDA 12.1
+- **PyTorch**: Version compatible with CUDA 12.1
+
 
 ### Installation
 
