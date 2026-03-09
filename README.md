@@ -15,31 +15,19 @@
 
 https://github.com/user-attachments/assets/5f599ad0-0922-414b-a8ab-e789da068efa
 
+## About EgoX
 
-## 📋 TODO
+**EgoX** is a novel egocentric video generation framework that produces first-person (ego-view) videos from a single third-person (exo-view) video input. By leveraging both exocentric observations and egocentric priors, EgoX enables realistic viewpoint transformation while preserving temporal consistency and scene structure. The method introduces a unified conditioning strategy that integrates spatial and channel-wise information within clean latent representations, requiring only lightweight LoRA-based adaptation. EgoX is built upon large-scale video diffusion models and is trained on the Ego-Exo4D dataset, making it a powerful tool for egocentric video synthesis and related research applications.
 
-### 🔹 This Week
-- [x] Release **inference code**
-- [x] Release **model weights**
-- [x] Release **data preprocessing code (for inference)**
-
----
-
-### 🔹 By End of December
-- [x] Release **training code**
-- [x] Release **data preprocessing code (for train)**
-
-### 🔹 Ongoing
-- [ ] Release **user-friendly interface**
 
 ## 🛠️ Environment Setup
 
 ### System Requirements
 
-- **GPU**: < 80GB (for inference) < 140GB (for train)
+- **GPU**: ≥ 80GB VRAM (for inference), ≥ 140GB VRAM (for training)
 - **CUDA**: 12.1 or higher
 - **Python**: 3.10
-- **PyTorch**: Compatible with CUDA 12.1
+- **PyTorch**: Version compatible with CUDA 12.1
 
 ### Installation
 
@@ -231,6 +219,104 @@ python3 infer.py \
     --use_GGA \
     --cos_sim_scaling_factor 3.0 \
     --in_the_wild
+```
+
+## 🏋️ Training
+
+### Data Preparation
+
+Prepare your training dataset with the following structure:
+
+```
+dataset/train/
+├── meta_with_uid.json         # Metadata for training videos
+├── videos/                    # Videos directory
+│   └── take_name/
+│       ├── exo.mp4            # Exocentric video
+│       ├── ego.mp4            # Egocentric ground truth video
+│       └── ego_Prior.mp4      # Egocentric prior video
+└── depth_maps/                # Depth maps directory
+    └── take_name/
+        ├── frame_000.npy
+        └── ...
+```
+
+The `meta_with_uid.json` follows the same format as `meta.json` used in inference, with additional `ego_path` field pointing to the egocentric ground truth video.
+
+To generate metadata and captions for your dataset:
+```bash
+# Initialize metadata from folder structure
+python meta_init.py --folder_path ./dataset/train --output_json ./dataset/train/meta_with_uid.json --overwrite
+
+# Generate captions using GPT-4o (requires OpenAI API key configured in caption.py)
+python caption.py --json_file ./dataset/train/meta_with_uid.json --output_json ./dataset/train/meta_with_uid.json --overwrite
+```
+
+For depth maps and camera parameters, follow the instructions from [EgoX-EgoPriorRenderer](https://github.com/kdh8156/EgoX-EgoPriorRenderer/tree/main).
+
+### Quick Start
+
+Run training with the default configuration (4 GPUs):
+
+```bash
+bash scripts/finetune.sh
+```
+
+This uses Hugging Face `accelerate` for distributed training. The script trains a LoRA adapter on top of the Wan2.1-I2V-14B pretrained model.
+
+### Custom Training Configuration
+
+You can modify `scripts/finetune.sh` or create a new script. Below is an example command with all key arguments.
+
+<details>
+<summary><b>Custom Training Configuration</b></summary>
+
+```bash
+export TOKENIZERS_PARALLELISM=false
+
+accelerate launch \
+    --config_file configs_acc/4gpu.yaml \
+    --main_process_ip localhost \
+    --main_process_port 29501 \
+    --machine_rank 0 \
+    --num_processes 4 \
+    --num_machines 1 \
+    finetune.py \
+    --model_path ./checkpoints/pretrained_model/Wan2.1-I2V-14B-480P-Diffusers \
+    --model_name wan-i2v \
+    --model_type wan-i2v \
+    --training_type lora \
+    --rank 256 \
+    --lora_alpha 256 \
+    --output_dir ./results/EgoX \
+    --report_to tensorboard \
+    --data_root ./dataset/train \
+    --meta_data_file ./dataset/train/meta_with_uid.json \
+    --train_resolution 49x448x1232 \
+    --train_epochs 150 \
+    --seed 42 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --mixed_precision bf16 \
+    --num_workers 16 \
+    --pin_memory True \
+    --nccl_timeout 1800 \
+    --checkpointing_steps 250 \
+    --checkpointing_limit 54 \
+    --gen_fps 30 \
+    --cos_sim_scaling_factor 1.0
+```
+
+To change the number of GPUs, use the corresponding accelerate config in `configs_acc/` (e.g., `1gpu.yaml`, `2gpu.yaml`, `4gpu.yaml`, `8gpu.yaml`) and update `--num_processes` accordingly.
+
+</details>
+
+### Resume Training
+
+To resume training from a checkpoint, uncomment and modify the `--resume_from_checkpoint` argument in the script:
+
+```bash
+    --resume_from_checkpoint ./results/EgoX/checkpoint-10000
 ```
 
 ## 🌟 Star History
