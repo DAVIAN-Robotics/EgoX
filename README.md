@@ -1,4 +1,4 @@
-# EgoX: Egocentric Video Generation from a Single Exocentric Video
+# [CVPR 2026] EgoX: Egocentric Video Generation from a Single Exocentric Video
 
 [![Hugging Face Paper](https://img.shields.io/badge/HuggingFace-Paper%20of%20the%20Day%20%231-orange)](https://huggingface.co/papers/2512.08269)
 [![arXiv](https://img.shields.io/badge/arXiv-2510.26236-b31b1b.svg)](https://arxiv.org/abs/2512.08269)
