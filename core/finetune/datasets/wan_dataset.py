@@ -240,7 +240,7 @@ class BaseWanDataset(Dataset):
             if self.depth_map_paths is not None:
                 try:
                     ego_prior_video_tensor, _ = self.preprocess(ego_prior_video, None, "ego_prior")
-                except:
+                except Exception:
                     ego_prior_video_tensor, _ = self.preprocess(ego_prior_video, None, "ego_prior_GGA")
             else:
                 ego_prior_video_tensor, _ = self.preprocess(ego_prior_video, None, "ego_prior")
