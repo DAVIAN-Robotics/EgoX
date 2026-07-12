@@ -72,7 +72,7 @@ def create_meta_init(folder_path, output_json_path, overwrite=False):
                         if not rel_ego_path.startswith(".") and not rel_ego_path.startswith("/"):
                             rel_ego_path = "./" + rel_ego_path
                         dataset_entry["ego_prior_path"] = rel_ego_path
-                     except:
+                     except (ValueError, OSError):
                         dataset_entry["ego_prior_path"] = str(ego_path)
 
                 datasets.append(dataset_entry)
