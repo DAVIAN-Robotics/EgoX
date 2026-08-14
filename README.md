@@ -319,10 +319,6 @@ To resume training from a checkpoint, uncomment and modify the `--resume_from_ch
     --resume_from_checkpoint ./results/EgoX/checkpoint-10000
 ```
 
-## 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=DAVIAN-Robotics/EgoX&type=date&legend=top-left)](https://www.star-history.com/#DAVIAN-Robotics/EgoX&type=date&legend=top-left)
-
 ## 🙏 Acknowledgements
 
 This project is built upon the following works:
