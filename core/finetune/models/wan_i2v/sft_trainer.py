@@ -6,7 +6,7 @@ from diffusers import (
     FlowMatchEulerDiscreteScheduler,
     WanImageToVideoPipeline,
 )
-from core.finetune.models.wan_i2v.custom_transformer import WanTransformer3DModel_GGA as WanTransformer3DModel
+from core.finetune.models.wan_i2v.custom_transformer    import WanTransformer3DModel_GGA as WanTransformer3DModel
 from diffusers.utils import (
     replace_example_docstring,
     logging,
@@ -54,6 +54,7 @@ from core.finetune.schemas import Wan_Components as Components
 from core.finetune.trainer import Trainer
 from core.finetune.utils import unwrap_model
 
+
 from ..utils import register
 
 from diffusers import (
@@ -65,14 +66,14 @@ def generate_uniform_pointmap(height, width):
     x = np.linspace(-1, 1, width)
     y = np.linspace(-1, 1, height)
     xv, yv = np.meshgrid(x, y)
-    
+
     # Create a spatially varying Z value: increases from bottom (row 0) to top (row height-1)
     zv = 1 - np.linspace(0, 1, height)[:, None]  # shape (H, 1)
     zv = np.repeat(zv, width, axis=1)        # shape (H, W)
-    
+
     # Stack to get (H, W, 3) array
     pointmap = np.stack([xv, yv, zv], axis=-1)
-    
+
     # Normalize XYZ to [0, 1] for image saving
     # X and Y are already in [-1, 1], so map to [0, 1]
     pointmap[..., 0] = (pointmap[..., 0] + 1) / 2
@@ -98,14 +99,27 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         self,
         tokenizer: AutoTokenizer,
         text_encoder: UMT5EncoderModel,
-        image_encoder: CLIPVisionModel,
-        image_processor: CLIPImageProcessor,
+        # image_encoder: CLIPVisionModel,
+        # image_processor: CLIPImageProcessor,
         transformer: WanTransformer3DModel,
         vae: AutoencoderKLWan,
         scheduler: FlowMatchEulerDiscreteScheduler,
+        transformer_2: WanTransformer3DModel,
+        boundary_ratio: float = 0.900,
     ):
-        super().__init__(tokenizer, text_encoder, image_encoder, image_processor, transformer, vae, scheduler)
+        # [Wan2.2] image_encoder/image_processor accepted for API compatibility but passed as None (no CLIP)
+        super().__init__(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            image_encoder=None,
+            image_processor=None,
+            transformer=transformer,
+            vae=vae,
+            scheduler=scheduler,
+        )
         self._shared_latent_exo_randn = None
+        self.transformer_2 = transformer_2
+        self.boundary_ratio = boundary_ratio
 
     @override
     def prepare_latents(
@@ -115,18 +129,18 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         num_channels_latents: int = 16,
         height: int = 480,
         exo_width: int = 784,
-        ego_width: int = 448, 
+        ego_width: int = 448,
         num_frames: int = 49,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
         last_images: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
         # Calculate latent dimensions for each view type
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
-        exo_latent_width = exo_width // self.vae_scale_factor_spatial  
+        exo_latent_width = exo_width // self.vae_scale_factor_spatial
         ego_latent_width = ego_width // self.vae_scale_factor_spatial
         total_latent_width = exo_latent_width + ego_latent_width
 
@@ -150,17 +164,17 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         # Add batch dimension if missing (video_processor outputs [C, F, H, W], VAE expects [B, C, F, H, W])
         if ego_prior_video.dim() == 4:
             ego_prior_video = ego_prior_video.unsqueeze(0)  # Add batch dimension
-        
+
         ego_prior_latents = self.encode_video(ego_prior_video.to(device=device, dtype=self.vae.dtype))
-        
+
         # Calculate ego region boundaries
-        latent_total_width = self._shared_latent_exo_randn.shape[-1] 
+        latent_total_width = self._shared_latent_exo_randn.shape[-1]
         ego_latent_width = ego_prior_latents.shape[-1]
         exo_latent_width = latent_total_width - ego_latent_width
-        
+
         # Create a copy to avoid modifying the shared variable
         video_condition = self._shared_latent_exo_randn.clone()
-        
+
         # Replace ego region (right part) with ego_prior_latents
         video_condition[:, :, :, :, exo_latent_width:] = ego_prior_latents
 
@@ -173,10 +187,10 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         # Create mask for exo and ego views
         # Use num_frames (target frame count) like the parent class, not frame_num (input frame count)
         mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, total_latent_width)
-        
+
         # Set exo_view mask (left part) to 1.0
         mask_lat_size[:, :, :, :, :exo_latent_width] = 1.0
-        # Set ego_view mask (right part) to 0.0  
+        # Set ego_view mask (right part) to 0.0
         mask_lat_size[:, :, :, :, exo_latent_width:] = 0.0
 
         if last_images is None:
@@ -191,18 +205,18 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         mask_lat_size = mask_lat_size.to(latent_condition.device)
 
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1), (exo_latent_width, ego_latent_width)
-    
+
     def encode_video(self, video: torch.Tensor) -> torch.Tensor:
         """Encode video to latent space (copied from Trainer)"""
         # shape of input video: [B, C, F, H, W]
         vae = self.vae
         video = video.to(vae.device, dtype=vae.dtype)
-        
+
         # Ensure video is in [B, C, F, H, W] format
         if video.dim() == 5 and video.shape[1] != 3:
             # If video is [B, F, C, H, W], transpose to [B, C, F, H, W]
             video = video.permute(0, 2, 1, 3, 4)
-        
+
         latent_dist = vae.encode(video).latent_dist
         latent = latent_dist.sample()
         latents_mean = (
@@ -215,87 +229,53 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         )
         latent = (latent - latents_mean) * latents_std
         return latent
-    
-    def _setup_ic_lora_latent(self, exo_video, generator, device, height, width, 
+
+
+    def _setup_ic_lora_latent(self, exo_video, generator, device, height, width,
                             num_frames, batch_size=1, num_videos_per_prompt=1):
         """Setup shared latent for IC-LoRA (exo + random ego)"""
         if exo_video is None:
             return
-            
+
         # Calculate latent dimensions
         latent_height = height // self.vae_scale_factor_spatial
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         num_channels_latents = self.vae.config.z_dim
-        
-        # Actual ego = 448 pixels -> 56 latents  
+
+        # Actual ego = 448 pixels -> 56 latents
         ego_pixel_width = 448
         ego_latent_width = ego_pixel_width // self.vae_scale_factor_spatial
-        
+
         batch_size = batch_size * num_videos_per_prompt # prepare_latent에서 bsz를 이렇게 넘기고 있음
-        
+
         # Encode exo_video using encode_video method
         # Add batch dimension if needed: [C, F, H, W] -> [1, C, F, H, W]
         if exo_video.dim() == 4:
             exo_video = exo_video.unsqueeze(0)
         exo_latents = self.encode_video(exo_video)  # [B, C, F, H, exo_latent_width]
         exo_latents = exo_latents.repeat(batch_size, 1, 1, 1, 1)
-        
+
         # Generate random ego latent
         ego_shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, ego_latent_width)
         # Generate on CPU with generator, then move to device
         ego_latents = torch.randn(ego_shape, generator=generator, dtype=exo_latents.dtype).to(device)
-        
+
         # Concatenate exo + ego latents
         self._shared_latent_exo_randn = torch.cat([exo_latents, ego_latents], dim=-1)
-        
+
         print(f"Setup IC-LoRA latent: exo_shape={exo_latents.shape}, ego_shape={ego_latents.shape}, total_shape={self._shared_latent_exo_randn.shape}")
 
     @override
     def encode_image(
         self,
-        exo_video: PipelineImageInput,
+        image: PipelineImageInput,
         device: Optional[torch.device] = None,
     ):
         """
-        Override encode_image to use shared latent for image embedding
-        Input: exo video only
-        Return: CLIPEncode(decode(encode(exo video first frame)+randn_tensor))
+        [Wan2.2] Override: Wan2.2 does NOT use CLIP image encoder.
+        Returns None — all conditioning is via concat in latent space.
         """
-        device = device or self._execution_device
-        
-        # Use full latent for temporal consistency (not just first frame)
-        full_latent = self._shared_latent_exo_randn  # [B, C, F, H, W]
-        
-        # Decode latent back to pixel space
-        # Remove VAE normalization first
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(full_latent.device, full_latent.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            full_latent.device, full_latent.dtype
-        )
-        
-        # Denormalize
-        denorm_latent = full_latent / latents_std + latents_mean
-        
-        # Decode full video for temporal consistency, then extract first frame
-        decoded_video = self.vae.decode(denorm_latent.to(self.vae.dtype), return_dict=False)[0]
-        decoded_image = decoded_video[:, :, 0, :, :]  # Extract first frame [B, C, H, W]
-        
-        print(f"Decoded image shape: {decoded_image.shape} for CLIP encoding")
-        
-        # Convert to float32 for CLIP compatibility (BFloat16 not supported by transformers image processor)
-        decoded_image = decoded_image.to(dtype=torch.float32)
-        
-        # Convert from [-1, 1] to [0, 1] range for CLIP processor
-        decoded_image = (decoded_image + 1.0) / 2.0
-        
-        # Use decoded image for CLIP encoding - processor handles all normalization
-        image = self.image_processor(images=decoded_image, return_tensors="pt", do_rescale=False).to(device)
-        image_embeds = self.image_encoder(**image, output_hidden_states=True)
-        return image_embeds.hidden_states[-2]
+        return None
 
     @override
     def check_inputs(
@@ -361,9 +341,10 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         negative_prompt: Union[str, List[str]] = None,
         height: int = 448,
         width: int = 784+448, #1232
-        num_frames: int = 49,
+        num_frames: int = 81,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
+        guidance_scale_2: Optional[float] = None,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
@@ -468,7 +449,7 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
         device = self._execution_device
-        
+
         # Preprocess exo_video for IC-LoRA setup
         if not isinstance(exo_video, torch.Tensor):
             # Truncate frames and convert PipelineImageInput to tensor and resize to exo dimensions
@@ -476,7 +457,7 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
             exo_video_processed = self.video_processor.preprocess(exo_video_truncated, height=height, width=width-height).to(device, dtype=torch.float32)
         else:
             exo_video_processed = exo_video.to(device, dtype=torch.float32)
-            
+
         # Setup IC-LoRA latent at the beginning
         self._setup_ic_lora_latent(
             exo_video=exo_video_processed,
@@ -510,7 +491,11 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
+        if self.config.boundary_ratio is not None and guidance_scale_2 is None:
+            guidance_scale_2 = guidance_scale
+            
         self._guidance_scale = guidance_scale
+        self._guidance_scale_2 = guidance_scale_2
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
@@ -535,19 +520,11 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
             device=device,
         )
 
-        # Encode image embedding
+        # [Wan2.2] No CLIP: skip encode_image() and image_embeds handling
         transformer_dtype = self.transformer.dtype
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
-
-        if image_embeds is None:
-            if last_image is None:
-                image_embeds = self.encode_image(exo_video, device)
-            else:
-                image_embeds = self.encode_image([exo_video, last_image], device)
-        image_embeds = image_embeds.repeat(batch_size, 1, 1)
-        image_embeds = image_embeds.to(transformer_dtype)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -571,7 +548,7 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         # Calculate individual widths from total width
         exo_width = width-height
         ego_width = height
-        
+
         latents, condition, (exo_latent_width, ego_latent_width) = self.prepare_latents(
             ego_prior_video,
             batch_size * num_videos_per_prompt,
@@ -591,6 +568,11 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        if self.config.boundary_ratio is not None:
+            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+        else:
+            boundary_timestep = None
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -600,11 +582,20 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
                 latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
 
-                noise_pred = self.transformer(
+                # [Wan2.2] MoE: select model for this timestep
+                if boundary_timestep is None or t >= boundary_timestep:
+                # wan2.1 or high-noise stage in wan2.2
+                    current_model = self.transformer
+                    current_guidance_scale = guidance_scale
+                else:
+                # low-noise stage in wan2.2
+                    current_model = self.transformer_2
+                    current_guidance_scale = guidance_scale_2
+
+                noise_pred = current_model(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
-                    encoder_hidden_states_image=image_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                     attention_GGA=attention_GGA,
@@ -619,11 +610,10 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
                 )[0]
 
                 if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
+                    noise_uncond = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
-                        encoder_hidden_states_image=image_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                         attention_GGA=attention_GGA,
@@ -636,7 +626,7 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
                         save_attn_dir_name=save_attn_dir_name,
                         save_attn_dir_step=f'step_{i:02d}',
                     )[0]
-                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # Set exo region (left part) of noise_pred to 0 to prevent exo latents from being updated
                 # ego_latent_width = ego_width // self.vae_scale_factor_spatial  # ego_width = height = 448
@@ -678,11 +668,11 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
             # video = self.vae.decode(latents, return_dict=False)[0]
             latent_exo = latents[:, :, :, :, :exo_latent_width]  # [B, C, F, H, exo_latent_width]
             latent_ego = latents[:, :, :, :, exo_latent_width:]   # [B, C, F, H, ego_latent_width]
-            
+
             # Decode each part separately
             video_exo = self.vae.decode(latent_exo, return_dict=False)[0]  # [B, 3, F, H_exo, W_exo]
             video_ego = self.vae.decode(latent_ego, return_dict=False)[0]  # [B, 3, F, H_ego, W_ego]
-            
+
             # Concatenate along width dimension
             video = torch.cat([video_exo, video_ego], dim=-1)  # [B, 3, F, H, W_exo + W_ego]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
@@ -698,34 +688,39 @@ class WanWidthConcatImageToVideoPipeline(WanImageToVideoPipeline):
         return WanPipelineOutput(frames=video)
 
 class WanI2VSftTrainer(Trainer):
-    UNLOAD_LIST = ["text_encoder", "image_encoder", "image_processor"]
+    UNLOAD_LIST = ["text_encoder"]  # [Wan2.2] no CLIP
 
     @override
     def load_components(self) -> Dict[str, Any]:
         components = Components()
         model_path = str(self.args.model_path)
 
-        components.pipeline_cls = WanImageToVideoPipeline
+        components.pipeline_cls = WanWidthConcatImageToVideoPipeline
 
         components.tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
 
         components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
 
-        components.transformer = WanTransformer3DModel.from_pretrained(model_path, subfolder="transformer")
+        # [Wan2.2] MoE: load TWO transformers (see wan_i2v_A14B config)
+        components.transformer = WanTransformer3DModel.from_pretrained(
+            model_path, subfolder="transformer", torch_dtype=self.state.weight_dtype)       # high noise model
+        
+        components.transformer_2 = WanTransformer3DModel.from_pretrained(
+            model_path, subfolder="transformer_2", torch_dtype=self.state.weight_dtype)     # low noise model
+        components.boundary_ratio = getattr(self.args, "boundary_ratio", 0.900)
 
         components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
 
         components.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
 
-        components.image_encoder = CLIPVisionModel.from_pretrained(model_path, subfolder="image_encoder")
-
-        components.image_processor = CLIPImageProcessor.from_pretrained(model_path, subfolder="image_processor")
+        # [Wan2.2] image_encoder/image_processor omitted (Wan2.2 has no CLIP)
 
         return components
 
     @override
     def prepare_models(self) -> None:
         self.state.transformer_config = self.components.transformer.config
+        self.state.transformer_2_config = self.components.transformer_2.config
 
     @override
     def initialize_pipeline(self) -> WanWidthConcatImageToVideoPipeline:
@@ -735,8 +730,10 @@ class WanI2VSftTrainer(Trainer):
             vae=self.components.vae,
             transformer=unwrap_model(self.accelerator, self.components.transformer),
             scheduler=self.components.scheduler,
-            image_encoder=self.components.image_encoder,
-            image_processor=self.components.image_processor,
+            image_encoder=None,
+            image_processor=None,
+            transformer_2=unwrap_model(self.accelerator, self.components.transformer_2),
+            boundary_ratio=self.components.boundary_ratio,
         )
         return pipe
 
@@ -775,41 +772,19 @@ class WanI2VSftTrainer(Trainer):
     @override
     def encode_first_frame(self, image: torch.Tensor) -> torch.Tensor:
         """
-        Encode image using CLIP image encoder for dataset preprocessing
-        
-        Args:
-            image: [C, H, W] single image tensor
-            
-        Returns:
-            image_embedding: [1, sequence_length, embedding_dimension]
+        [Wan2.2] Wan2.2 has no CLIP image encoder. Returns None.
         """
-        # Ensure image is 3D [C, H, W]
-        if image.dim() != 3:
-            raise ValueError(f"Expected 3D image tensor [C, H, W], got {image.dim()}D tensor with shape {image.shape}")
-        
-        # Add batch dimension [1, C, H, W]
-        image = image.unsqueeze(0)
-        
-        # Use CLIP image processor and encoder
-        # Ensure image encoder is on the same device as inputs to avoid type/device mismatch
-        self.components.image_encoder = self.components.image_encoder.to(self.accelerator.device)
-        self.components.image_encoder.eval()
-
-        processed_image = self.components.image_processor(images=image, return_tensors="pt")
-        processed_image = {k: v.to(self.accelerator.device) for k, v in processed_image.items()}
-
-        image_embeds = self.components.image_encoder(**processed_image, output_hidden_states=True)
-        return image_embeds.hidden_states[-2]  # [1, sequence_length, embedding_dimension]
+        return None
 
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        ret = {"encoded_exo_ego_gt_video": [], "prompt_embedding": [], "encoded_exo_ego_prior_video": [], "image_embedding": [], "attention_GGA": [], "attention_mask_GGA": [], "point_vecs_per_frame": [], "cam_rays": []}
+        ret = {"encoded_exo_ego_gt_video": [], "prompt_embedding": [], "encoded_exo_ego_prior_video": [], "attention_GGA": [], "attention_mask_GGA": [], "point_vecs_per_frame": [], "cam_rays": []}
 
         for sample in samples:
             encoded_exo_ego_gt_video = sample["encoded_exo_ego_gt_video"]  # exo+ego_gt concatenated and encoded
             prompt_embedding = sample["prompt_embedding"]
             encoded_exo_ego_prior_video = sample["encoded_exo_ego_prior_video"]  # exo+ego_prior concatenated and encoded
-            image_embedding = sample["image_embedding"]  # from exo_video
+            # [Wan2.2] image_embedding accepted but unused (no CLIP)
 
             attention_GGA = sample["attention_GGA"]
             attention_mask_GGA = sample["attention_mask_GGA"]
@@ -820,7 +795,6 @@ class WanI2VSftTrainer(Trainer):
             ret["encoded_exo_ego_gt_video"].append(encoded_exo_ego_gt_video)
             ret["prompt_embedding"].append(prompt_embedding)
             ret["encoded_exo_ego_prior_video"].append(encoded_exo_ego_prior_video)
-            ret["image_embedding"].append(image_embedding)
             if attention_GGA is not None:
                 ret["attention_GGA"].append(attention_GGA)
                 ret["attention_mask_GGA"].append(attention_mask_GGA)
@@ -830,7 +804,7 @@ class WanI2VSftTrainer(Trainer):
         ret["encoded_exo_ego_gt_video"] = torch.stack(ret["encoded_exo_ego_gt_video"])
         ret["prompt_embedding"] = torch.stack(ret["prompt_embedding"])
         ret["encoded_exo_ego_prior_video"] = torch.stack(ret["encoded_exo_ego_prior_video"])  # [B, C, F, H, W_exo+W_ego]
-        ret["image_embedding"] = torch.stack(ret["image_embedding"])
+        # [Wan2.2] image_embedding stays as empty list (no CLIP)
 
         if len(ret["attention_GGA"]) > 0:
             ret["attention_GGA"] = torch.stack(ret["attention_GGA"])
@@ -851,14 +825,18 @@ class WanI2VSftTrainer(Trainer):
 
     @override
     def compute_loss(self, batch) -> torch.Tensor:
-        # Unwrap in case the transformer is wrapped by DDP/Accelerate
-        transformer = unwrap_model(self.accelerator, self.components.transformer)
-        transformer_dtype = transformer.dtype
+        # [Wan2.2] MoE: uniformly sample timestep from [0, 999];
+        # the timestep itself is the expert router:
+        #   t <  boundary_ratio * 1000 → low_noise_model
+        #   t >= boundary_ratio * 1000 → high_noise_model
+        # (vs Wan2.1 sft_trainer: timestep sampled from full range unconditionally)
+        boundary_step = int(self.components.boundary_ratio * self.components.scheduler.config.num_train_timesteps)
+
+        transformer_dtype = self.components.transformer.dtype
 
         prompt_embedding = batch["prompt_embedding"].to(transformer_dtype)
         latent = batch["encoded_exo_ego_gt_video"].to(transformer_dtype)
         latent_condition = batch["encoded_exo_ego_prior_video"].to(transformer_dtype)
-        image_embedding = batch["image_embedding"].to(transformer_dtype)
 
         #####
         attention_GGA = batch["attention_GGA"] if "attention_GGA" in batch else None
@@ -878,22 +856,22 @@ class WanI2VSftTrainer(Trainer):
 
         # Get actual number of frames from video_condition
         actual_num_frames = (num_frames - 1) * vae_scale_factor_temporal + 1
-        
+
         mask_lat_size = torch.ones(latent_condition.shape[0], 1, actual_num_frames, latent_condition.shape[3], latent_condition.shape[4])
-        
+
         exo_width, ego_width = 784, 448 #! HARD CODING
         vae_scale_factor_spatial = 2 ** len(self.components.vae.config.temperal_downsample) # 8
-        exo_latent_width = exo_width // vae_scale_factor_spatial  
+        exo_latent_width = exo_width // vae_scale_factor_spatial
         ego_latent_width = ego_width // vae_scale_factor_spatial
         # Set exo_view mask (left part) to 1.0
         mask_lat_size[:, :, :, :, :exo_latent_width] = 1.0
-        # Set ego_view mask (right part) to 0.0  
+        # Set ego_view mask (right part) to 0.0
         mask_lat_size[:, :, :, :, exo_latent_width:] = 0.0
-        
+
         # Use the same masking logic as WanWidthConcatImageToVideoPipeline.prepare_latents
         # Apply temporal masking (only first frame is visible, rest are masked)
         mask_lat_size[:, :, list(range(1, actual_num_frames - 1))] = 0
-            
+
         first_frame_mask = mask_lat_size[:, :, 0:1]
         first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=vae_scale_factor_temporal)
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
@@ -903,26 +881,26 @@ class WanI2VSftTrainer(Trainer):
 
         condition = torch.concat([mask_lat_size, latent_condition], dim=1) # [B, 20, 13, latent_H, latent_W]
 
-        # Sample a random timestep for each sample
-        timesteps_idx = torch.randint(0, self.components.scheduler.config.num_train_timesteps, (batch_size,))
-        timesteps_idx = timesteps_idx.long()
+        # [Wan2.2] Uniform timestep sampling; timestep itself routes to expert
+        timesteps_idx = torch.randint(0, self.components.scheduler.config.num_train_timesteps, (batch_size,)).long()
+        batch_boundary = timesteps_idx[0].item() < boundary_step
+        current_model = self.components.transformer_2 if batch_boundary else self.components.transformer
         timesteps = self.components.scheduler.timesteps[timesteps_idx].to(device=latent.device)
         sigmas = self.get_sigmas(timesteps, n_dim=latent.ndim, dtype=latent.dtype)
         # Add noise to latent
         noise = torch.randn_like(latent)
         noisy_latents = (1.0 - sigmas) * latent + sigmas * noise
-        
+
         # Apply IC-LoRA style masking: keep exo region (left) as original, only noise ego region (right)
         noisy_latents[:, :, :, :, :-ego_latent_width] = latent[:, :, :, :, :-ego_latent_width]
-        
+
         target = noise - latent
         latent_model_input = torch.cat([noisy_latents, condition], dim=1) # [B, 36, 13, latent_H, latent_W]
 
 
-        predicted_noise = self.components.transformer(  
+        predicted_noise = current_model(
             hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embedding,
-            encoder_hidden_states_image=image_embedding,
             timestep=timesteps,
             return_dict=False,
             attention_GGA=attention_GGA,
@@ -935,7 +913,7 @@ class WanI2VSftTrainer(Trainer):
 
         ego_predicted_noise = predicted_noise[:, :, :, :, -ego_latent_width:]
         ego_target = target[:, :, :, :, -ego_latent_width:]
-        
+
         loss = torch.mean(((ego_predicted_noise.float() - ego_target.float()) ** 2).reshape(batch_size, -1), dim=1)
         loss = loss.mean()
 
