@@ -22,6 +22,7 @@ class Components(BaseModel):
 
     # Denoiser
     transformer: Any = None
+    transformer_2: Any = None
     unet: Any = None
 
     # Scheduler
@@ -46,6 +47,7 @@ class Wan_Components(BaseModel):
 
     # Denoiser
     transformer: Any = None
+    transformer_2: Any = None
     unet: Any = None
 
     # Scheduler
@@ -56,4 +58,7 @@ class Wan_Components(BaseModel):
 
     # Image Processor
     image_processor: Any = None
+
+    # Boundary ratio
+    boundary_ratio: float | None = None
     

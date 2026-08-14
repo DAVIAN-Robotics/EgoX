@@ -13,8 +13,8 @@ class State(BaseModel):
     train_width: int
 
     transformer_config: Dict[str, Any] = None
-
-    weight_dtype: torch.dtype = torch.float32  # dtype for mixed precision training
+    transformer_2_config: Dict[str, Any] = None
+    weight_dtype: torch.dtype = torch.bfloat16  # dtype for mixed precision training
     num_trainable_parameters: int = 0
     overwrote_max_train_steps: bool = False
     num_update_steps_per_epoch: int = 0
