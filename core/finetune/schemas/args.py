@@ -68,6 +68,7 @@ class Args(BaseModel):
     gradient_checkpointing: bool = True
     enable_slicing: bool = True
     enable_tiling: bool = True
+    unload_vae_after_precompute: bool = False
     nccl_timeout: int = 1800
 
     ########## Lora ##########
@@ -165,6 +166,7 @@ class Args(BaseModel):
         parser.add_argument("--gradient_checkpointing", type=bool, default=True)
         parser.add_argument("--enable_slicing", type=bool, default=True)
         parser.add_argument("--enable_tiling", type=bool, default=True)
+        parser.add_argument("--unload_vae_after_precompute", action="store_true")
         parser.add_argument("--nccl_timeout", type=int, default=1800)
 
         # LoRA parameters

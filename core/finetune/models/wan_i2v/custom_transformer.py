@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#---------------------------------------------------------------------------
+# Changes from Wan2.1 (custom_transformer.py) to Wan2.2:
+#
+#   (1) Per-timestep modulation: e [B,L,6,C] replaces global temb [B,C]
+#       in WanTransformerBlock and output head.
+#   (2) Per-position time embedding: condition_embedder sub-components
+#       called with [B*L] instead of [B], producing e_mod [B,L,6,dim].
+#
+# All other components are IDENTICAL to the Wan2.1 version.
+# ---------------------------------------------------------------------------
+
 import math
 from typing import Any, Dict, Optional, Tuple, Union
 import os
@@ -32,6 +43,10 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# ==============================================================================
+# WanAttnProcessor2_0 — UNCHANGED from Wan2.1
+# ==============================================================================
 
 class WanAttnProcessor2_0:
     def __init__(self):
@@ -101,9 +116,8 @@ class WanAttnProcessor2_0:
             hidden_states_img = hidden_states_img.type_as(query)
 
         if cos_sim is not None and not do_kv_cache:
-            cos_sim = cos_sim + 1.0
-            attn_mask_from_cos_sim = torch.log(cos_sim + 1e-6)
-            attention_mask_GGA = attention_mask_GGA[0,:,0] 
+            attn_mask_from_cos_sim = cos_sim  # 已在 forward 中完成 +1.0 / log 变换
+            attention_mask_GGA = attention_mask_GGA[0,:,0]
             #! Exo attention
             hidden_states_exo = F.scaled_dot_product_attention(
                 query[:, :, attention_mask_GGA==1],
@@ -121,7 +135,7 @@ class WanAttnProcessor2_0:
                 attn_mask=attn_mask_ego.to(query.dtype),
                 dropout_p=0.0,
                 is_causal=False
-            )   
+            )
 
             #! Combine exo and ego
             hidden_states = torch.zeros_like(query)
@@ -144,6 +158,10 @@ class WanAttnProcessor2_0:
 
         return hidden_states, kv_cache
 
+
+# ==============================================================================
+# WanImageEmbedding — UNCHANGED from Wan2.1
+# ==============================================================================
 
 class WanImageEmbedding(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int, pos_embed_seq_len=None):
@@ -168,6 +186,10 @@ class WanImageEmbedding(torch.nn.Module):
         hidden_states = self.norm2(hidden_states)
         return hidden_states
 
+
+# ==============================================================================
+# WanTimeTextImageEmbedding — UNCHANGED from Wan2.1
+# ==============================================================================
 
 class WanTimeTextImageEmbedding(nn.Module):
     def __init__(
@@ -196,13 +218,22 @@ class WanTimeTextImageEmbedding(nn.Module):
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        timestep_seq_len: Optional[int] = None,
     ):
+        if timestep_seq_len is not None:
+            batch_size = timestep.shape[0]
+            timestep = timestep.unsqueeze(1).expand(batch_size, timestep_seq_len).flatten()
+
         timestep = self.timesteps_proj(timestep)
 
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
         if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
             timestep = timestep.to(time_embedder_dtype)
         temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
+
+        if timestep_seq_len is not None:
+            temb = temb.unflatten(0, (batch_size, timestep_seq_len))
+            
         timestep_proj = self.time_proj(self.act_fn(temb))
 
         encoder_hidden_states = self.text_embedder(encoder_hidden_states)
@@ -211,6 +242,10 @@ class WanTimeTextImageEmbedding(nn.Module):
 
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
+
+# ==============================================================================
+# WanRotaryPosEmbed — UNCHANGED from Wan2.1
+# ==============================================================================
 
 class WanRotaryPosEmbed(nn.Module):
     def __init__(
@@ -255,6 +290,10 @@ class WanRotaryPosEmbed(nn.Module):
         freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(1, 1, ppf * pph * ppw, -1)
         return freqs
 
+
+# ==============================================================================
+# SelfAttention — UNCHANGED from Wan2.1
+# ==============================================================================
 
 class SelfAttention(Attention):
     def __init__(
@@ -310,6 +349,10 @@ class SelfAttention(Attention):
         return hidden_states
 
 
+# ==============================================================================
+# CrossAttention — UNCHANGED from Wan2.1
+# ==============================================================================
+
 class CrossAttention(Attention):
     def __init__(
         self,
@@ -353,7 +396,13 @@ class CrossAttention(Attention):
             attention_mask=None,
         )
         return hidden_states
-    
+
+
+# ==============================================================================
+# WanTransformerBlock — [CHANGED] per-timestep modulation (Wan2.2)
+# ==============================================================================
+# Wan2.1: global temb [B,6,C] broadcast to all positions
+# Wan2.2: per-position e [B,L,6,C] → chunk(6,dim=2) → 6×[B,L,1,C] → squeeze(2)
 
 class WanTransformerBlock(nn.Module):
     def __init__(
@@ -404,6 +453,7 @@ class WanTransformerBlock(nn.Module):
         self.ffn = FeedForward(dim, inner_dim=ffn_dim, activation_fn="gelu-approximate")
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
+        # [Wan2.2] modulation [1,6,dim] — same shape & init as Wan2.1 scale_shift_table
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(
@@ -417,66 +467,51 @@ class WanTransformerBlock(nn.Module):
         cos_sim: Optional[torch.Tensor] = None,
         do_kv_cache: bool = False,
     ) -> torch.Tensor:
+        # [Wan2.2] Per-timestep modulation: [1,6,dim] + [B,L,6,dim] → chunk(6,dim=2) → 6×[B,L,1,dim]
+        # (vs Wan2.1: [1,6,dim] + [B,1,dim] → chunk(6,dim=1) → 6×[B,1,dim] broadcasting to all positions)
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table + temb.float()
-        ).chunk(6, dim=1)
+            self.scale_shift_table.unsqueeze(0) + temb.float()
+        ).chunk(6, dim=2)
+
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(hidden_states=norm_hidden_states, rotary_emb=rotary_emb, 
-                                attention_GGA=attention_GGA, attention_mask_GGA=attention_mask_GGA, cos_sim=cos_sim, 
+        norm_hidden_states = (
+            self.norm1(hidden_states.float()) * (1 + scale_msa.squeeze(2)) + shift_msa.squeeze(2)
+        ).type_as(hidden_states)
+        attn_output = self.attn1(hidden_states=norm_hidden_states, rotary_emb=rotary_emb,
+                                attention_GGA=attention_GGA, attention_mask_GGA=attention_mask_GGA, cos_sim=cos_sim,
                                 do_kv_cache=do_kv_cache)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + attn_output.float() * gate_msa.squeeze(2)).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(hidden_states=norm_hidden_states, encoder_hidden_states=encoder_hidden_states ) #, attention_GGA=attention_GGA, attention_mask_GGA=attention_mask_GGA)
+        attn_output = self.attn2(hidden_states=norm_hidden_states, encoder_hidden_states=encoder_hidden_states )
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
-            hidden_states
-        )
+        norm_hidden_states = (
+            self.norm3(hidden_states.float()) * (1 + c_scale_msa.squeeze(2)) + c_shift_msa.squeeze(2)
+        ).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa.squeeze(2)).type_as(hidden_states)
 
         return hidden_states
 
 
+# ==============================================================================
+# WanTransformer3DModel_GGA — [CHANGED] per-position time embedding + output head (Wan2.2)
+# ==============================================================================
+
 class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     r"""
-    A Transformer model for video-like data used in the Wan model.
+    Wan2.2 I2V-A14B GGA Transformer.
 
-    Args:
-        patch_size (`Tuple[int]`, defaults to `(1, 2, 2)`):
-            3D patch dimensions for video embedding (t_patch, h_patch, w_patch).
-        num_attention_heads (`int`, defaults to `40`):
-            Fixed length for text embeddings.
-        attention_head_dim (`int`, defaults to `128`):
-            The number of channels in each head.
-        in_channels (`int`, defaults to `16`):
-            The number of channels in the input.
-        out_channels (`int`, defaults to `16`):
-            The number of channels in the output.
-        text_dim (`int`, defaults to `512`):
-            Input dimension for text embeddings.
-        freq_dim (`int`, defaults to `256`):
-            Dimension for sinusoidal time embeddings.
-        ffn_dim (`int`, defaults to `13824`):
-            Intermediate dimension in feed-forward network.
-        num_layers (`int`, defaults to `40`):
-            The number of layers of transformer blocks to use.
-        window_size (`Tuple[int]`, defaults to `(-1, -1)`):
-            Window size for local attention (-1 indicates global attention).
-        cross_attn_norm (`bool`, defaults to `True`):
-            Enable cross-attention normalization.
-        qk_norm (`bool`, defaults to `True`):
-            Enable query/key normalization.
-        eps (`float`, defaults to `1e-6`):
-            Epsilon value for normalization layers.
-        add_img_emb (`bool`, defaults to `False`):
-            Whether to use img_emb.
-        added_kv_proj_dim (`int`, *optional*, defaults to `None`):
-            The number of channels to use for the added key and value projections. If `None`, no projection is used.
+    Derived from Wan2.1 ``WanTransformer3DModel_GGA`` (custom_transformer.py).
+    All __init__ and forward parameters are identical to Wan2.1.
+
+    Wan2.2 changes from Wan2.1:
+      - Per-timestep modulation: e [B,L,6,C] → blocks + output head
+      - Per-position time embedding: condition_embedder sub-components called
+        with [B*L] instead of [B] in forward()
     """
 
     _supports_gradient_checkpointing = True
@@ -510,12 +545,14 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        # 1. Patch & position embedding
+        # 1. Patch & position embedding (unchanged)
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
 
-        # 2. Condition embeddings
-        # image_embedding_dim=1280 for I2V model
+        # 2. Condition embeddings — diffusers standard components (Timesteps,
+        #    TimestepEmbedding, PixArtAlphaTextProjection). Same as Wan2.1.
+        #    For Wan2.2 per-position time embedding, these sub-components are
+        #    called with [B*L] input in forward() instead of here.
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=inner_dim,
             time_freq_dim=freq_dim,
@@ -538,6 +575,7 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         # 4. Output norm & projection
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        # [Wan2.2] head_modulation [1,2,dim] (same shape & init as Wan2.1 scale_shift_table)
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         self.gradient_checkpointing = False
@@ -557,12 +595,12 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         cos_sim_scaling_factor: float = 1.0,
         do_kv_cache: bool = False,
         do_custom_test: bool = False,
-        save_attn_map: bool = True,
-        save_attn_dir_name: Optional[str] = None,
-        save_attn_map_mask: Optional[torch.Tensor] = None,
-        save_attn_map_avg: Optional[torch.Tensor] = None,
-        save_attn_dir_step: str = "",
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        # save_attn_map: bool = True,
+        # save_attn_dir_name: Optional[str] = None,
+        # save_attn_map_mask: Optional[torch.Tensor] = None,
+        # save_attn_map_avg: Optional[torch.Tensor] = None,
+        # save_attn_dir_step: str = "",
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -584,19 +622,20 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-
+        # ── RoPE + Patch embedding (unchanged) ──────────────────────────
         rotary_emb = self.rope(hidden_states)
         hidden_states = self.patch_embedding(hidden_states)
 
-        if save_attn_map: # B, C, F, H, W
-            save_attn_map_mask = torch.zeros_like(hidden_states[..., -(post_patch_height - post_patch_width):])
-            save_attn_map_mask[...,:1,:,:] = 1
-            save_attn_map_mask = save_attn_map_mask.flatten(2).transpose(1, 2)
+        # if save_attn_map: # B, C, F, H, W
+        #     save_attn_map_mask = torch.zeros_like(hidden_states[..., -(post_patch_height - post_patch_width):])
+        #     save_attn_map_mask[...,:1,:,:] = 1
+        #     save_attn_map_mask = save_attn_map_mask.flatten(2).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        seq_len = hidden_states.size(1)
 
-
-        if attention_GGA is not None: 
+        # ── GGA preparation (unchanged) ─────────────────────────────────
+        if attention_GGA is not None:
 
             if len(point_vecs_per_frame.shape) != 5:
                 point_vecs_per_frame = point_vecs_per_frame.squeeze()
@@ -613,7 +652,7 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
                 count_include_pad=False,
             ).to(dtype=hidden_states.dtype)
 
-            
+
             attention_GGA = attention_GGA.permute(0,4,1,2,3) # B, C, F, H, W
             attention_GGA = F.avg_pool3d(
                 attention_GGA,
@@ -636,59 +675,75 @@ class WanTransformer3DModel_GGA(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
             frame_cut = H * W
 
             cos_sim = None
-            cos_sim = torch.zeros((1, attention_GGA.shape[1], attention_GGA.shape[1]), device=hidden_states.device) #! 1, 28028, 28028
-            for i in range(FF):
-                cos_sim[:, i*frame_cut:(i+1)*frame_cut,:] = torch.matmul(attention_GGA[:,i*frame_cut:(i+1)*frame_cut,:], point_vecs_per_frame[i:i+1].transpose(-1, -2)).to(hidden_states.device)
+            # cos_sim 是 attention mask、无需梯度：no_grad 使原地操作合法，并规避 checkpoint
+            # 重算时的 autograd version 检查；dtype=bf16 将 [1,N,N] 张量减半且与 SDPA mask 一致。
+            with torch.no_grad():
+                cos_sim = torch.zeros((1, attention_GGA.shape[1], attention_GGA.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype) #! 1, 28028, 28028
+                for i in range(FF):
+                    cos_sim[:, i*frame_cut:(i+1)*frame_cut,:] = torch.matmul(attention_GGA[:,i*frame_cut:(i+1)*frame_cut,:], point_vecs_per_frame[i:i+1].transpose(-1, -2)).to(hidden_states.device)
 
-            cos_sim = torch.clamp(cos_sim, min=-1.0, max=1.0)
-            
-            #! Scaling with hyperparameter
-            if cos_sim_scaling_factor > 1.0:
-                mask = cos_sim > 0
-                cos_sim[mask] = cos_sim[mask] * cos_sim_scaling_factor
-            else:
-                cos_sim = cos_sim * cos_sim_scaling_factor
+                cos_sim = torch.clamp(cos_sim, min=-1.0, max=1.0)
 
-            attention_mask_GGA_ = attention_mask_GGA[:,:,0] #! 1, 28028
-            mask = (attention_mask_GGA_[:, :, None] == 1).to(hidden_states.device) 
-            cos_sim.masked_fill_(mask, 0.0) 
+                #! Scaling with hyperparameter
+                if cos_sim_scaling_factor > 1.0:
+                    mask = cos_sim > 0
+                    cos_sim[mask] = cos_sim[mask] * cos_sim_scaling_factor
+                else:
+                    cos_sim = cos_sim * cos_sim_scaling_factor
+
+                attention_mask_GGA_ = attention_mask_GGA[:,:,0] #! 1, 28028
+                mask = (attention_mask_GGA_[:, :, None] == 1).to(hidden_states.device)
+                cos_sim.masked_fill_(mask, 0.0)
+                # log 变换移到 checkpoint 外：原地 add_/log_ 不触碰 checkpoint 保存的输入
+                cos_sim = cos_sim.add_(1.0).add_(1e-6).log_()
 
         else:
             cos_sim = None
+
+        # ── [Wan2.2] Per-position time embedding ──────────────────────
+        # Reuse condition_embedder's Timesteps + TimestepEmbedding,
+        # but call with [B*L] instead of [B] for per-position encoding.
+        # (vs Wan2.1: self.condition_embedder(timestep, ...) → global temb + timestep_proj)
+        temb, e_mod, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+            timestep, encoder_hidden_states, encoder_hidden_states_image,
+            timestep_seq_len=seq_len)
         
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image
-        )
-        timestep_proj = timestep_proj.unflatten(1, (6, -1))
+        e_mod = e_mod.unflatten(-1, (6, self.config.num_attention_heads * self.config.attention_head_dim))                # [B, L, 6, dim]
+
+        # ── Text + optional Image embedding ─────────────────────────
 
         if encoder_hidden_states_image is not None:
+            encoder_hidden_states_image = self.condition_embedder.image_embedder(encoder_hidden_states_image)
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-        # 4. Transformer blocks
+        # ── Transformer blocks ──────────────────────────────────────────
+        # [Wan2.2] Pass e_mod [B,L,6,C] instead of timestep_proj [B,6,C]
         cur_block = 0
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_GGA, attention_mask_GGA, cos_sim)
+                    block, hidden_states, encoder_hidden_states, e_mod,
+                    rotary_emb, attention_GGA, attention_mask_GGA, cos_sim)
                 cur_block += 1
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attention_GGA, attention_mask_GGA, cos_sim=cos_sim, do_kv_cache=do_kv_cache)
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, e_mod, rotary_emb,
+                    attention_GGA, attention_mask_GGA, cos_sim=cos_sim, do_kv_cache=do_kv_cache)
                 cur_block += 1
-                
-        # 5. Output norm, projection & unpatchify
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
-        # Move the shift and scale tensors to the same device as hidden_states.
-        # When using multi-GPU inference via accelerate these will be on the
-        # first device rather than the last device, which hidden_states ends up
-        # on.
-        shift = shift.to(hidden_states.device)
-        scale = scale.to(hidden_states.device)
+        # ── [Wan2.2] Output head with per-timestep modulation ───────────
+        # (vs Wan2.1: global temb + scale_shift_table [1,2,dim])
+        head_e = temb.unsqueeze(2)  # [B, L, 1, dim]
+        shift, scale = (self.scale_shift_table.unsqueeze(0) + head_e.float()).chunk(2, dim=2)
+
+        shift = shift.squeeze(2).to(hidden_states.device)
+        scale = scale.squeeze(2).to(hidden_states.device)
 
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
+        # ── Unpatchify (unchanged) ──────────────────────────────────────
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
         )

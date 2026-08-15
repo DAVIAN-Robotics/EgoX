@@ -5,7 +5,7 @@ import math
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
+import os
 import diffusers
 import torch
 import transformers
@@ -57,7 +57,11 @@ _DTYPE_MAP = {
     "fp16": torch.float16,  # FP16 is Only Support for CogVideoX-2B
     "bf16": torch.bfloat16,
 }
-
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, transformer_auto_wrap_policy, _or_policy
+from accelerate import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import BackwardPrefetch
+from functools import partial
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 class Trainer:
     # If set, should be a list of components to unload (refer to `Components``)
@@ -155,6 +159,8 @@ class Trainer:
                 self.components.vae.enable_tiling()
 
         self.state.transformer_config = self.components.transformer.config
+        if self.components.transformer_2 is not None:
+            self.state.transformer_2_config = self.components.transformer_2.config
 
     def prepare_dataset(self) -> None:
         logger.info("Initializing dataset and dataloader")
@@ -166,8 +172,7 @@ class Trainer:
                 max_num_frames=self.state.train_frames,
                 height=self.state.train_height,
                 width=self.state.train_width,
-                trainer=self,
-                
+                trainer=self,              
             )
         else:
             raise ValueError(f"Invalid model type: {self.args.model_type}")
@@ -225,7 +230,7 @@ class Trainer:
         # For SFT, we train all the parameters in transformer model
         for attr_name, component in vars(self.components).items():
             if hasattr(component, "requires_grad_"):
-                if self.args.training_type == "sft" and attr_name == "transformer":
+                if self.args.training_type == "sft" and attr_name in ["transformer", "transformer_2"]:
                     component.requires_grad_(True)
                 else:
                     component.requires_grad_(False)
@@ -237,29 +242,53 @@ class Trainer:
                 init_lora_weights=True,
                 target_modules=self.args.target_modules,
             )
+            transformer_2_lora_config = LoraConfig(
+                r=self.args.rank,
+                lora_alpha=self.args.lora_alpha,
+                init_lora_weights=True,
+                target_modules=self.args.target_modules,
+            )
             self.components.transformer.add_adapter(transformer_lora_config)
-            self.__prepare_saving_loading_hooks(transformer_lora_config)
+            self.components.transformer_2.add_adapter(transformer_2_lora_config)
+            # LoRA权重与基座格式对齐
+            self.components.transformer = self.components.transformer.to(dtype=torch.bfloat16)
+            self.components.transformer_2 = self.components.transformer_2.to(dtype=torch.bfloat16)
+            self.__prepare_saving_loading_hooks(transformer_lora_config, transformer_2_lora_config)
             for name, param in self.components.transformer.named_parameters():
                 if 'learnable_domain_embeddings' in name:
                     param.requires_grad_(True)
-                    logger.info(f"Training {name} after adding LoRA")
+                    logger.info(f"Training transfomer {name} after adding LoRA")
+            for name, param in self.components.transformer_2.named_parameters():
+                if 'learnable_domain_embeddings' in name:
+                    param.requires_grad_(True)
+                    logger.info(f"Training transformer_2 {name} after adding LoRA")
 
         # Load components needed for training to GPU (except transformer), and cast them to the specified data type
-        ignore_list = ["transformer"] + self.UNLOAD_LIST
+        ignore_list = ["transformer", "transformer_2"] + self.UNLOAD_LIST
+        if self.args.unload_vae_after_precompute:
+            ignore_list.append("vae")
+            logger.info("Keeping VAE on CPU after latent precompute")
         self.__move_components_to_device(dtype=weight_dtype, ignore_list=ignore_list)
 
         if self.args.gradient_checkpointing:
             self.components.transformer.enable_gradient_checkpointing()
+            if self.components.transformer_2 is not None:
+                self.components.transformer_2.enable_gradient_checkpointing()
 
     def prepare_optimizer(self) -> None:
         logger.info("Initializing optimizer and lr scheduler")
 
         # Make sure the trainable params are in float32
-        cast_training_params([self.components.transformer], dtype=torch.float32)
+        # models_to_cast = [self.components.transformer]
+        # if self.components.transformer_2 is not None:
+        #    models_to_cast.append(self.components.transformer_2)
+        # cast_training_params(models_to_cast, dtype=torch.float32)
 
         # For LoRA, we only want to train the LoRA weights
         # For SFT, we want to train all the parameters
         trainable_parameters = list(filter(lambda p: p.requires_grad, self.components.transformer.parameters()))
+        if self.components.transformer_2 is not None:
+            trainable_parameters += list(filter(lambda p: p.requires_grad, self.components.transformer_2.parameters()))
         transformer_parameters_with_lr = {
             "params": trainable_parameters,
             "lr": self.args.learning_rate,
@@ -318,9 +347,12 @@ class Trainer:
         self.lr_scheduler = lr_scheduler
 
     def prepare_for_training(self) -> None:
-        self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
-            self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler
-        )
+        if self.components.transformer_2 is not None:
+            self.components.transformer, self.components.transformer_2, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
+            self.components.transformer, self.components.transformer_2, self.optimizer, self.data_loader, self.lr_scheduler)
+        else:
+            self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
+            self.components.transformer, self.optimizer, self.data_loader, self.lr_scheduler)
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(len(self.data_loader) / self.args.gradient_accumulation_steps)
@@ -400,8 +432,11 @@ class Trainer:
             logger.debug(f"Starting epoch ({epoch + 1}/{self.args.train_epochs})")
 
             self.components.transformer.train()
-            models_to_accumulate = [self.components.transformer]
-
+            if self.components.transformer_2 is not None:
+                self.components.transformer_2.train()
+                models_to_accumulate = [self.components.transformer, self.components.transformer_2]
+            else:
+                models_to_accumulate = [self.components.transformer]
             for step, batch in enumerate(self.data_loader):
                 logger.debug(f"Starting step {step + 1}")
                 logs = {}
@@ -413,13 +448,18 @@ class Trainer:
 
                     if accelerator.sync_gradients:
                         if accelerator.distributed_type == DistributedType.DEEPSPEED:
-                            grad_norm = self.components.transformer.get_global_grad_norm()
-                            # In some cases the grad norm may not return a float
-                            if torch.is_tensor(grad_norm):
-                                grad_norm = grad_norm.item()
+                            grad_norms = [self.components.transformer.get_global_grad_norm()]
+                            if self.components.transformer_2 is not None:
+                               grad_norms.append(self.components.transformer_2.get_global_grad_norm())
+                            grad_norm = max(
+                               g.item() if torch.is_tensor(g) else g
+                               for g in grad_norms)
                         else:
+                            all_transformer_parameters = list(self.components.transformer.parameters())
+                            if self.components.transformer_2 is not None:
+                                all_transformer_parameters = list(self.components.transformer.parameters()) + list(self.components.transformer_2.parameters())
                             grad_norm = accelerator.clip_grad_norm_(
-                                self.components.transformer.parameters(), self.args.max_grad_norm
+                                all_transformer_parameters, self.args.max_grad_norm
                             )
                             if torch.is_tensor(grad_norm):
                                 grad_norm = grad_norm.item()
@@ -449,7 +489,10 @@ class Trainer:
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
         accelerator.wait_for_everyone()
-        self.__maybe_save_checkpoint(global_step, must_save=True)
+        if global_step % self.args.checkpointing_steps == 0:
+            logger.info(f"Skipping duplicate final checkpoint save for step {global_step}")
+        else:
+            self.__maybe_save_checkpoint(global_step, must_save=True)
 
 
         del self.components
@@ -475,9 +518,6 @@ class Trainer:
     def load_components(self) -> Components:
         raise NotImplementedError
 
-    def initialize_pipeline(self) -> DiffusionPipeline:
-        raise NotImplementedError
-
     def encode_video(self, video: torch.Tensor) -> torch.Tensor:
         # shape of input video: [B, C, F, H, W], where B = 1
         # shape of output video: [B, C', F', H', W'], where B = 1
@@ -485,11 +525,6 @@ class Trainer:
 
     def encode_text(self, text: str) -> torch.Tensor:
         # shape of output text: [batch size, sequence length, embedding dimension]
-        raise NotImplementedError
-
-    def encode_first_frame(self, image: torch.Tensor) -> torch.Tensor:
-        # shape of input image: [C, H, W] single image
-        # shape of output: [batch_size, sequence_length, embedding_dimension]
         raise NotImplementedError
 
     def compute_loss(self, batch) -> torch.Tensor:
@@ -521,63 +556,100 @@ class Trainer:
                 if name in unload_list:
                     setattr(self.components, name, component.to("cpu"))
 
-    def __prepare_saving_loading_hooks(self, transformer_lora_config):
+    def __prepare_saving_loading_hooks(self, transformer_lora_config, transformer_2_lora_config = None):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        """
+        register save/load hook。每次 checkpoint 保存时，分别写入 transformer_lora.bin 和
+        transformer_2_lora.bin; 恢复时从这两个文件加载。
+
+        Args:
+            transformer_lora_config:   transformer 的 LoRA 配置
+            transformer_2_lora_config: transformer_2 的 LoRA 配置（可选，默认同 transformer）
+        """
+        if transformer_2_lora_config is None:
+            transformer_2_lora_config = transformer_lora_config
+
+        lora_configs = {
+            "transformer": transformer_lora_config,
+            "transformer_2": transformer_2_lora_config,
+        }
+        # save hook
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
-                transformer_lora_layers_to_save = None
+                # 使用 unwrapped 后的对象身份 (id) 做精确匹配，避免两个同构模型
+                # 因 isinstance 无法区分而依赖 models 列表顺序的隐式风险
+                transformer_ref = unwrap_model(self.accelerator, self.components.transformer)
+                ref_to_key = {id(transformer_ref): "transformer"}
+
+                if self.components.transformer_2 is not None:
+                    transformer_2_ref = unwrap_model(self.accelerator, self.components.transformer_2)
+                    ref_to_key[id(transformer_2_ref)] = "transformer_2"
 
                 for model in models:
-                    if isinstance(
-                        unwrap_model(self.accelerator, model),
-                        type(unwrap_model(self.accelerator, self.components.transformer)),
-                    ):
-                        model = unwrap_model(self.accelerator, model)
-                        transformer_lora_layers_to_save = get_peft_model_state_dict(model)
-                    else:
+                    unwrapped = unwrap_model(self.accelerator, model)
+                    key = ref_to_key.get(id(unwrapped))
+                    if key is None:
                         raise ValueError(f"Unexpected save model: {model.__class__}")
+
+                    lora_state_dict = get_peft_model_state_dict(unwrapped)
+                    save_path = os.path.join(output_dir, f"{key}_lora.bin")
+                    torch.save(lora_state_dict, save_path)
+                    logger.info(f"Saved {key} LoRA weights → {save_path}")
 
                     # make sure to pop weight so that corresponding model is not saved again
                     if weights:
                         weights.pop()
 
-                self.components.pipeline_cls.save_lora_weights(
-                    output_dir,
-                    transformer_lora_layers=transformer_lora_layers_to_save,
-                )
 
         def load_model_hook(models, input_dir):
-            if not self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-                while len(models) > 0:
-                    model = models.pop()
-                    if isinstance(
-                        unwrap_model(self.accelerator, model),
-                        type(unwrap_model(self.accelerator, self.components.transformer)),
-                    ):
-                        transformer_ = unwrap_model(self.accelerator, model)
-                    else:
-                        raise ValueError(f"Unexpected save model: {unwrap_model(self.accelerator, model).__class__}")
-            else:
-                transformer_ = unwrap_model(self.accelerator, self.components.transformer).__class__.from_pretrained(
-                    self.args.model_path, subfolder="transformer"
-                )
-                transformer_.add_adapter(transformer_lora_config)
+            # 使用 unwrapped 后的对象身份 (id) 做精确匹配，与 save 侧一致，
+            # 完全消除对 models 列表顺序的隐式依赖
+            transformer_ref = unwrap_model(self.accelerator, self.components.transformer)
+            ref_to_key = {id(transformer_ref): "transformer"}
 
-            lora_state_dict = self.components.pipeline_cls.lora_state_dict(input_dir)
-            transformer_state_dict = {
-                f'{k.replace("transformer.", "")}': v
-                for k, v in lora_state_dict.items()
-                if k.startswith("transformer.")
-            }
-            incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
-            if incompatible_keys is not None:
-                # check only for unexpected keys
-                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                if unexpected_keys:
+            if self.components.transformer_2 is not None:
+                transformer_2_ref = unwrap_model(self.accelerator, self.components.transformer_2)
+                ref_to_key[id(transformer_2_ref)] = "transformer_2"
+
+            model_map = {}
+            while len(models) > 0:
+                model = models.pop()
+                unwrapped = unwrap_model(self.accelerator, model)
+                key = ref_to_key.get(id(unwrapped))
+                if key is None:
+                    raise ValueError(f"Unexpected load model: {unwrapped.__class__}")
+                if key in model_map:
                     logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
+                        f"Duplicate model identity match for '{key}' — overwriting."
+                        " This may indicate the same model was passed twice in models list."
                     )
+                model_map[key] = unwrapped
+
+            # 对每个 transformer，从独立 .bin 文件加载 LoRA 权重
+            for key in ["transformer", "transformer_2"]:
+                if key not in model_map:
+                    logger.warning(f"Model {key} not found in checkpoint models list, skipping")
+                    continue
+                transformer_ = model_map[key]
+                save_path = os.path.join(input_dir, f"{key}_lora.bin")
+                if not os.path.exists(save_path):
+                    logger.warning(f"LoRA weights file not found: {save_path}, skipping {key}")
+                    continue
+                lora_state_dict = torch.load(save_path, map_location="cpu")
+                incompatible_keys = set_peft_model_state_dict(
+                    transformer_, lora_state_dict, adapter_name="default"
+                )
+                if incompatible_keys is not None:
+                    unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                    if unexpected_keys:
+                        logger.warning(
+                            f"Loading {key} adapter weights → unexpected keys: {unexpected_keys}"
+                        )
+                    missing_keys = getattr(incompatible_keys, "missing_keys", None)
+                    if missing_keys:
+                        logger.warning(
+                            f"Loading {key} adapter weights → missing keys: {missing_keys}"
+                        )
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
